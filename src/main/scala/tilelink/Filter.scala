@@ -86,9 +86,18 @@ object TLFilter
 
   // make only the intersected address sets visible
   def mSelectIntersect(select: AddressSet): ManagerFilter = { m =>
-    val filtered = m.address.map(_.intersect(select)).flatten
-    val alignment = select.alignment /* alignment 0 means 'select' selected everything */
-    transferSizeHelper(m, filtered, alignment)
+    mSelectIntersects(Seq(select))(m)
+  }
+
+  // make only the union of the intersected address sets visible
+  def mSelectIntersects(selects: Seq[AddressSet]): ManagerFilter = { m =>
+    val filtered = for {
+      select <- selects
+      address <- m.address
+      intersection <- address.intersect(select)
+    } yield intersection
+    val alignment: BigInt = if (filtered.isEmpty) BigInt(0) else filtered.map(_.alignment).min
+    transferSizeHelper(m, filtered.distinct, alignment)
   }
 
   // make everything except the intersected address sets visible

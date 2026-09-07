@@ -48,15 +48,32 @@ case object ExtMem extends Field[Option[MemoryPortParams]](None)
 case object ExtBus extends Field[Option[MasterPortParams]](None)
 case object ExtIn extends Field[Option[SlavePortParams]](None)
 
+/**
+  * Physical ranges within ExtMem that a CPU must reach without allocating a
+  * cache line.  The backing AXI port remains unchanged; this key only removes
+  * TileLink Acquire capability from the selected manager view.  It is empty by
+  * default so existing platforms retain their current PMA contract.
+  */
+case object ExtMemNonCacheableRegions extends Field[Seq[AddressSet]](Nil)
+
 ///// The following traits add ports to the sytem, in some cases converting to different interconnect standards
 
 /** Adds a port to the system intended to master an AXI4 DRAM controller. */
 trait CanHaveMasterAXI4MemPort { this: BaseSubsystem =>
   private val memPortParamsOpt = p(ExtMem)
+  private val nonCacheableRegions = p(ExtMemNonCacheableRegions)
   private val portName = "axi4"
   private val device = new MemoryDevice
   private val idBits = memPortParamsOpt.map(_.master.idBits).getOrElse(1)
   private val mbus = tlBusWrapperLocationMap.get(MBUS).getOrElse(viewpointBus)
+
+  memPortParamsOpt.foreach { params =>
+    val memoryRanges = AddressSet.misaligned(params.master.base, params.master.size)
+    nonCacheableRegions.foreach { region =>
+      require(memoryRanges.exists(_.contains(region)),
+        s"non-cacheable ExtMem range $region is outside ExtMem")
+    }
+  }
 
   val memAXI4Node = AXI4SlaveNode(memPortParamsOpt.map({ case MemoryPortParams(memPortParams, nMemoryChannels, _) =>
     Seq.tabulate(nMemoryChannels) { channel =>
@@ -104,21 +121,53 @@ trait CanHaveMasterAXI4MemPort { this: BaseSubsystem =>
       })
     })
 
+    // The inclusive L2 accepts only coherent, cacheable managers.  Remove
+    // shared A53/Rocket memory from that path and expose it directly on SBUS
+    // through the existing AXI bypass crossbar.  The direct manager has no
+    // Acquire capability, so Rocket's PMA marks it non-cacheable.
+    if (nonCacheableRegions.nonEmpty) {
+      viewpointBus.coupleTo(s"memory_controller_noncacheable_bypass_port_named_$portName") {
+        (mbus.crossIn(mem_bypass_xbar)(ValName("bus_xing"))(p(SbusToMbusXTypeKey))
+          := TLWidthWidget(viewpointBus.beatBytes)
+          := TLFilter(TLFilter.mMaskCacheable)
+          := TLFilter(TLFilter.mSelectIntersects(nonCacheableRegions))
+          := TLFilter(TLFilter.mResourceRemover)
+          := _
+        )
+      }
+    }
+
     mbus.coupleTo(s"memory_controller_port_named_$portName") {
-      // Disable monitors on this connection since the class with this trait (i.e. DigitalTop) doesn't provide an
-      // implicit clock for the monitor.
-      (DisableMonitors { implicit p => memAXI4Node := AXI4UserYanker() }
-        := AXI4IdIndexer(idBits)
-        := TLToAXI4()
-        := TLWidthWidget(mbus.beatBytes)
-        := mem_bypass_xbar
-        := _
-      )
+      // Disable monitors on this connection since the class with this trait
+      // (i.e. DigitalTop) doesn't provide an implicit clock for the monitor.
+      if (nonCacheableRegions.nonEmpty) {
+        (DisableMonitors { implicit p => memAXI4Node := AXI4UserYanker() }
+          := AXI4IdIndexer(idBits)
+          := TLToAXI4()
+          := TLWidthWidget(mbus.beatBytes)
+          := mem_bypass_xbar
+          := TLFilter(TLFilter.mSubtract(nonCacheableRegions))
+          := _
+        )
+      } else {
+        (DisableMonitors { implicit p => memAXI4Node := AXI4UserYanker() }
+          := AXI4IdIndexer(idBits)
+          := TLToAXI4()
+          := TLWidthWidget(mbus.beatBytes)
+          := mem_bypass_xbar
+          := _
+        )
+      }
     }
   }
 
   val mem_axi4 = InModuleBody { memAXI4Node.makeIOs() }
 }
+
+/** Mark selected external-memory ranges non-cacheable to Rocket-side CPUs. */
+class WithExtMemNonCacheableRegions(regions: Seq[AddressSet]) extends Config((site, here, up) => {
+  case ExtMemNonCacheableRegions => up(ExtMemNonCacheableRegions) ++ regions
+})
 
 /** Adds a AXI4 port to the system intended to master an MMIO device bus */
 trait CanHaveMasterAXI4MMIOPort { this: BaseSubsystem =>
