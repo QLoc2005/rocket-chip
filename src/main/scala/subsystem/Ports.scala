@@ -55,6 +55,10 @@ case object ExtIn extends Field[Option[SlavePortParams]](None)
   * default so existing platforms retain their current PMA contract.
   */
 case object ExtMemNonCacheableRegions extends Field[Seq[AddressSet]](Nil)
+/** Register the external-memory port paths for FPGA timing: a TLBuffer after
+  * each crossbar feeding the port and an AXI4Buffer at the AXI4 boundary.
+  * Off by default, which leaves the diplomatic graph unchanged. */
+case object ExtMemPortBuffers extends Field[Boolean](false)
 
 ///// The following traits add ports to the sytem, in some cases converting to different interconnect standards
 
@@ -66,6 +70,7 @@ trait CanHaveMasterAXI4MemPort { this: BaseSubsystem =>
   private val device = new MemoryDevice
   private val idBits = memPortParamsOpt.map(_.master.idBits).getOrElse(1)
   private val mbus = tlBusWrapperLocationMap.get(MBUS).getOrElse(viewpointBus)
+  private val portBuffers = p(ExtMemPortBuffers)
 
   memPortParamsOpt.foreach { params =>
     val memoryRanges = AddressSet.misaligned(params.master.base, params.master.size)
@@ -109,14 +114,14 @@ trait CanHaveMasterAXI4MemPort { this: BaseSubsystem =>
           InModuleBody { prefixSource.bundle := 0.U(1.W) }
           replicator
         }
-        viewpointBus.coupleTo(s"memory_controller_bypass_port_named_$portName") {
-          (mbus.crossIn(mem_bypass_xbar)(ValName("bus_xing"))(p(SbusToMbusXTypeKey))
-            := TLWidthWidget(viewpointBus.beatBytes)
+        viewpointBus.coupleTo(s"memory_controller_bypass_port_named_$portName") { busOut =>
+          val xing = mbus.crossIn(mem_bypass_xbar)(ValName("bus_xing"))(p(SbusToMbusXTypeKey))
+          val widened = (TLWidthWidget(viewpointBus.beatBytes)
             := replicator.node
             := TLFilter(TLFilter.mSubtract(cohRegion))
             := TLFilter(TLFilter.mResourceRemover)
-            := _
-          )
+            := busOut)
+          if (portBuffers) (xing := TLBuffer() := widened) else (xing := widened)
         }
       })
     })
@@ -126,38 +131,37 @@ trait CanHaveMasterAXI4MemPort { this: BaseSubsystem =>
     // through the existing AXI bypass crossbar.  The direct manager has no
     // Acquire capability, so Rocket's PMA marks it non-cacheable.
     if (nonCacheableRegions.nonEmpty) {
-      viewpointBus.coupleTo(s"memory_controller_noncacheable_bypass_port_named_$portName") {
-        (mbus.crossIn(mem_bypass_xbar)(ValName("bus_xing"))(p(SbusToMbusXTypeKey))
-          := TLWidthWidget(viewpointBus.beatBytes)
+      viewpointBus.coupleTo(s"memory_controller_noncacheable_bypass_port_named_$portName") { busOut =>
+        val xing = mbus.crossIn(mem_bypass_xbar)(ValName("bus_xing"))(p(SbusToMbusXTypeKey))
+        val widened = (TLWidthWidget(viewpointBus.beatBytes)
           := TLFilter(TLFilter.mMaskCacheable)
           := TLFilter(TLFilter.mSelectIntersects(nonCacheableRegions))
           := TLFilter(TLFilter.mResourceRemover)
-          := _
-        )
+          := busOut)
+        if (portBuffers) (xing := TLBuffer() := widened) else (xing := widened)
       }
     }
 
-    mbus.coupleTo(s"memory_controller_port_named_$portName") {
+    mbus.coupleTo(s"memory_controller_port_named_$portName") { busOut =>
       // Disable monitors on this connection since the class with this trait
       // (i.e. DigitalTop) doesn't provide an implicit clock for the monitor.
       if (nonCacheableRegions.nonEmpty) {
-        (DisableMonitors { implicit p => memAXI4Node := AXI4UserYanker() }
-          := AXI4IdIndexer(idBits)
-          := TLToAXI4()
-          := TLWidthWidget(mbus.beatBytes)
-          := mem_bypass_xbar
-          := TLFilter(TLFilter.mSubtract(nonCacheableRegions))
-          := _
-        )
+        mem_bypass_xbar := TLFilter(TLFilter.mSubtract(nonCacheableRegions)) := busOut
       } else {
-        (DisableMonitors { implicit p => memAXI4Node := AXI4UserYanker() }
-          := AXI4IdIndexer(idBits)
-          := TLToAXI4()
-          := TLWidthWidget(mbus.beatBytes)
-          := mem_bypass_xbar
-          := _
-        )
+        mem_bypass_xbar := busOut
       }
+      val xbarOut = if (portBuffers) (TLBuffer() := mem_bypass_xbar) else mem_bypass_xbar
+      val yanker = DisableMonitors { implicit p =>
+        val y = AXI4UserYanker()
+        if (portBuffers) (memAXI4Node := AXI4Buffer() := y) else (memAXI4Node := y)
+        y
+      }
+      (yanker
+        := AXI4IdIndexer(idBits)
+        := TLToAXI4()
+        := TLWidthWidget(mbus.beatBytes)
+        := xbarOut
+      )
     }
   }
 
